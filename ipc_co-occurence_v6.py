@@ -39,6 +39,9 @@ st.markdown("""
 - 출원일 기준 시계열 분석
 - 최대 3개 구간 비교 분석
 - 구간별 네트워크 변화 추적
+- **구간별 중심성 지표 증감 추이 분석**
+- **신규/소멸 노드 추적**
+- **연도별 중심성 지표 시각화**
 
 Gephi와 같은 네트워크 시각화 도구에서 사용할 수 있는 노드와 엣지 파일을 생성합니다.
 """)
@@ -404,9 +407,346 @@ def create_timeseries_visualization(stats_df, entity_type, periods_info=None):
     
     return fig
 
+def calculate_yearly_centrality_analysis(df, entity_column, entity_type, code_length=None):
+    """
+    연도별 중심성 지표를 계산합니다.
+    """
+    # 날짜 파싱
+    df_temp = df.copy()
+    df_temp['parsed_date'] = df_temp['출원일'].apply(parse_application_date)
+    df_temp = df_temp[df_temp['parsed_date'].notna()]
+    
+    if len(df_temp) == 0:
+        return {}
+    
+    df_temp['parsed_date'] = pd.to_datetime(df_temp['parsed_date'])
+    df_temp['year'] = df_temp['parsed_date'].dt.year
+    
+    yearly_results = {}
+    
+    for year in sorted(df_temp['year'].unique()):
+        year_data = df_temp[df_temp['year'] == year]
+        
+        if entity_type == "IPC":
+            edges, nodes = calculate_single_period_ipc(year_data, entity_column, code_length, f"{year}년")
+        else:
+            edges, nodes = calculate_single_period_entity(year_data, entity_column, entity_type, f"{year}년")
+        
+        # 중심성 지표가 있는지 확인하고, 필요한 컬럼만 선택
+        if len(nodes) > 0:
+            available_columns = ['Name']
+            
+            # 중심성 지표 컬럼들이 존재하는지 확인
+            for col in ['EC', 'BC', 'CC']:
+                if col in nodes.columns:
+                    available_columns.append(col)
+            
+            if len(available_columns) > 1:  # Name 외에 다른 컬럼이 있는 경우
+                yearly_results[year] = nodes[available_columns].copy()
+                yearly_results[year]['Year'] = year
+    
+    return yearly_results
+
+def create_centrality_trend_visualization(yearly_results, entity_type, top_n=5):
+    """
+    상위 노드들의 중심성 지표 추이를 시각화합니다.
+    """
+    if not yearly_results:
+        return None
+    
+    # 전체 기간에서 각 중심성 지표의 상위 노드들 식별
+    all_nodes_centrality = {}
+    
+    for year, nodes_df in yearly_results.items():
+        for _, row in nodes_df.iterrows():
+            node_name = row['Name']
+            if node_name not in all_nodes_centrality:
+                all_nodes_centrality[node_name] = {'EC': [], 'BC': [], 'CC': [], 'years': []}
+            
+            # 중심성 지표가 있는 경우에만 추가
+            if 'EC' in row:
+                all_nodes_centrality[node_name]['EC'].append(row['EC'])
+            else:
+                all_nodes_centrality[node_name]['EC'].append(0.0)
+                
+            if 'BC' in row:
+                all_nodes_centrality[node_name]['BC'].append(row['BC'])
+            else:
+                all_nodes_centrality[node_name]['BC'].append(0.0)
+                
+            if 'CC' in row:
+                all_nodes_centrality[node_name]['CC'].append(row['CC'])
+            else:
+                all_nodes_centrality[node_name]['CC'].append(0.0)
+            
+            all_nodes_centrality[node_name]['years'].append(year)
+    
+    # 각 중심성 지표별로 평균값 계산하여 상위 노드 선정
+    top_nodes = {'EC': [], 'BC': [], 'CC': []}
+    
+    for metric in ['EC', 'BC', 'CC']:
+        node_avg_centrality = []
+        for node_name, data in all_nodes_centrality.items():
+            if data[metric]:
+                avg_centrality = sum(data[metric]) / len(data[metric])
+                node_avg_centrality.append((node_name, avg_centrality))
+        
+        # 상위 N개 노드 선정
+        node_avg_centrality.sort(key=lambda x: x[1], reverse=True)
+        top_nodes[metric] = [node[0] for node in node_avg_centrality[:top_n]]
+    
+    # 시각화 생성
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=('Eigenvector Centrality 추이', 'Betweenness Centrality 추이', 'Closeness Centrality 추이'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}]]
+    )
+    
+    colors = px.colors.qualitative.Set1
+    
+    for col, metric in enumerate(['EC', 'BC', 'CC'], 1):
+        for i, node_name in enumerate(top_nodes[metric]):
+            if node_name in all_nodes_centrality:
+                years = all_nodes_centrality[node_name]['years']
+                values = all_nodes_centrality[node_name][metric]
+                
+                # 노드명 단축
+                display_name = f'{node_name[:20]}...' if len(node_name) > 20 else node_name
+                
+                # 각 서브플롯별로 고유한 trace 이름 생성
+                trace_name = f"{display_name} ({metric})"
+                
+                fig.add_trace(
+                    go.Scatter(
+                        x=years, 
+                        y=values,
+                        mode='lines+markers',
+                        name=trace_name,  # 서브플롯별 고유 이름
+                        line=dict(color=colors[i % len(colors)]),
+                        showlegend=True  # 모든 trace에 범례 표시
+                    ),
+                    row=1, col=col
+                )
+    
+    fig.update_layout(
+        title=f'{entity_type} 상위 {top_n}개 노드의 중심성 지표 추이',
+        height=500,
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.05
+        ),
+        margin=dict(r=150)  # 범례를 위한 오른쪽 여백 추가
+    )
+    
+    return fig
+
+def analyze_period_changes(period_results, analysis_type):
+    """
+    구간별 노드 변화를 분석합니다.
+    """
+    if len(period_results) < 2:
+        return None, None
+    
+    period_names = [name for name in period_results.keys() if name != "전체 기간"]
+    
+    # 구간별 노드 집합 생성
+    period_nodes = {}
+    period_centrality = {}
+    
+    for period_name, result in period_results.items():
+        nodes_df = result['nodes']
+        if len(nodes_df) > 0:
+            period_nodes[period_name] = set(nodes_df['Name'].tolist())
+            period_centrality[period_name] = nodes_df.set_index('Name')[['EC', 'BC', 'CC']].to_dict('index')
+        else:
+            period_nodes[period_name] = set()
+            period_centrality[period_name] = {}
+    
+    # 신규/소멸 노드 분석
+    changes_analysis = {}
+    
+    for i in range(1, len(period_names)):
+        prev_period = period_names[i-1]
+        curr_period = period_names[i]
+        
+        prev_nodes = period_nodes[prev_period]
+        curr_nodes = period_nodes[curr_period]
+        
+        new_nodes = curr_nodes - prev_nodes
+        disappeared_nodes = prev_nodes - curr_nodes
+        common_nodes = prev_nodes & curr_nodes
+        
+        changes_analysis[f"{prev_period} → {curr_period}"] = {
+            'new_nodes': list(new_nodes),
+            'disappeared_nodes': list(disappeared_nodes),
+            'common_nodes': list(common_nodes)
+        }
+    
+    # 중심성 지표 변화 분석
+    centrality_changes = {}
+    
+    for i in range(1, len(period_names)):
+        prev_period = period_names[i-1]
+        curr_period = period_names[i]
+        
+        prev_centrality = period_centrality[prev_period]
+        curr_centrality = period_centrality[curr_period]
+        
+        common_nodes = set(prev_centrality.keys()) & set(curr_centrality.keys())
+        
+        node_changes = []
+        for node in common_nodes:
+            prev_data = prev_centrality[node]
+            curr_data = curr_centrality[node]
+            
+            ec_change = curr_data['EC'] - prev_data['EC']
+            bc_change = curr_data['BC'] - prev_data['BC']
+            cc_change = curr_data['CC'] - prev_data['CC']
+            
+            node_changes.append({
+                'Node': node,
+                'EC_Change': ec_change,
+                'BC_Change': bc_change,
+                'CC_Change': cc_change,
+                'EC_Prev': prev_data['EC'],
+                'EC_Curr': curr_data['EC'],
+                'BC_Prev': prev_data['BC'],
+                'BC_Curr': curr_data['BC'],
+                'CC_Prev': prev_data['CC'],
+                'CC_Curr': curr_data['CC']
+            })
+        
+        centrality_changes[f"{prev_period} → {curr_period}"] = pd.DataFrame(node_changes)
+    
+    return changes_analysis, centrality_changes
+
+def display_period_changes_analysis(changes_analysis, centrality_changes, analysis_type):
+    """
+    구간별 변화 분석 결과를 표시합니다.
+    """
+    if not changes_analysis or not centrality_changes:
+        st.warning("구간별 변화 분석을 위해서는 최소 2개 이상의 구간이 필요합니다.")
+        return
+    
+    st.header(f"📈 {analysis_type} 구간별 변화 분석")
+    
+    for transition, changes in changes_analysis.items():
+        st.subheader(f"📊 {transition} 변화")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("신규 등장", len(changes['new_nodes']))
+            if changes['new_nodes']:
+                with st.expander(f"신규 등장 {analysis_type} 보기"):
+                    for node in changes['new_nodes'][:20]:  # 상위 20개만 표시
+                        st.write(f"• {node}")
+                    if len(changes['new_nodes']) > 20:
+                        st.write(f"... 외 {len(changes['new_nodes']) - 20}개")
+        
+        with col2:
+            st.metric("소멸", len(changes['disappeared_nodes']))
+            if changes['disappeared_nodes']:
+                with st.expander(f"소멸된 {analysis_type} 보기"):
+                    for node in changes['disappeared_nodes'][:20]:  # 상위 20개만 표시
+                        st.write(f"• {node}")
+                    if len(changes['disappeared_nodes']) > 20:
+                        st.write(f"... 외 {len(changes['disappeared_nodes']) - 20}개")
+        
+        with col3:
+            st.metric("지속", len(changes['common_nodes']))
+        
+        # 중심성 지표 변화 분석
+        if transition in centrality_changes:
+            centrality_df = centrality_changes[transition]
+            
+            if len(centrality_df) > 0:
+                st.subheader(f"🔄 {transition} 중심성 지표 변화")
+                
+                # 각 중심성 지표별 상위/하위 변화 노드들
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.write("**EC (고유벡터 중심성) 변화**")
+                    
+                    # 실제 상승한 노드들만 필터링
+                    ec_increased = centrality_df[centrality_df['EC_Change'] > 0].nlargest(5, 'EC_Change')[['Node', 'EC_Change', 'EC_Prev', 'EC_Curr']]
+                    # 실제 하락한 노드들만 필터링
+                    ec_decreased = centrality_df[centrality_df['EC_Change'] < 0].nsmallest(5, 'EC_Change')[['Node', 'EC_Change', 'EC_Prev', 'EC_Curr']]
+                    
+                    st.write("상승 TOP 5:")
+                    if len(ec_increased) > 0:
+                        for _, row in ec_increased.iterrows():
+                            st.write(f"📈 {row['Node']}")
+                            st.write(f"   {row['EC_Prev']:.4f} → {row['EC_Curr']:.4f} (변화: +{row['EC_Change']:.4f})")
+                    else:
+                        st.write("상승한 노드가 없습니다.")
+                    
+                    st.write("하락 TOP 5:")
+                    if len(ec_decreased) > 0:
+                        for _, row in ec_decreased.iterrows():
+                            st.write(f"📉 {row['Node']}")
+                            st.write(f"   {row['EC_Prev']:.4f} → {row['EC_Curr']:.4f} (변화: {row['EC_Change']:.4f})")
+                    else:
+                        st.write("하락한 노드가 없습니다.")
+                
+                with col2:
+                    st.write("**BC (매개 중심성) 변화**")
+                    
+                    bc_increased = centrality_df[centrality_df['BC_Change'] > 0].nlargest(5, 'BC_Change')[['Node', 'BC_Change', 'BC_Prev', 'BC_Curr']]
+                    bc_decreased = centrality_df[centrality_df['BC_Change'] < 0].nsmallest(5, 'BC_Change')[['Node', 'BC_Change', 'BC_Prev', 'BC_Curr']]
+                    
+                    st.write("상승 TOP 5:")
+                    if len(bc_increased) > 0:
+                        for _, row in bc_increased.iterrows():
+                            st.write(f"📈 {row['Node']}")
+                            st.write(f"   {row['BC_Prev']:.4f} → {row['BC_Curr']:.4f} (변화: +{row['BC_Change']:.4f})")
+                    else:
+                        st.write("상승한 노드가 없습니다.")
+                    
+                    st.write("하락 TOP 5:")
+                    if len(bc_decreased) > 0:
+                        for _, row in bc_decreased.iterrows():
+                            st.write(f"📉 {row['Node']}")
+                            st.write(f"   {row['BC_Prev']:.4f} → {row['BC_Curr']:.4f} (변화: {row['BC_Change']:.4f})")
+                    else:
+                        st.write("하락한 노드가 없습니다.")
+                
+                with col3:
+                    st.write("**CC (근접 중심성) 변화**")
+                    
+                    cc_increased = centrality_df[centrality_df['CC_Change'] > 0].nlargest(5, 'CC_Change')[['Node', 'CC_Change', 'CC_Prev', 'CC_Curr']]
+                    cc_decreased = centrality_df[centrality_df['CC_Change'] < 0].nsmallest(5, 'CC_Change')[['Node', 'CC_Change', 'CC_Prev', 'CC_Curr']]
+                    
+                    st.write("상승 TOP 5:")
+                    if len(cc_increased) > 0:
+                        for _, row in cc_increased.iterrows():
+                            st.write(f"📈 {row['Node']}")
+                            st.write(f"   {row['CC_Prev']:.4f} → {row['CC_Curr']:.4f} (변화: +{row['CC_Change']:.4f})")
+                    else:
+                        st.write("상승한 노드가 없습니다.")
+                    
+                    st.write("하락 TOP 5:")
+                    if len(cc_decreased) > 0:
+                        for _, row in cc_decreased.iterrows():
+                            st.write(f"📉 {row['Node']}")
+                            st.write(f"   {row['CC_Prev']:.4f} → {row['CC_Curr']:.4f} (변화: {row['CC_Change']:.4f})")
+                    else:
+                        st.write("하락한 노드가 없습니다.")
+                
+                # 전체 변화 데이터 다운로드
+                with st.expander(f"{transition} 전체 중심성 변화 데이터 보기"):
+                    st.dataframe(centrality_df.sort_values('EC_Change', ascending=False))
+        
+        st.divider()
+
 def calculate_ipc_cooccurrence_timeseries(df, ipc_column, code_length=4, periods=None):
     """시계열을 고려한 축약된 IPC 코드 간의 동시출현빈도를 계산합니다."""
-    
+
     # IPC 컬럼이 존재하는지 확인
     if ipc_column not in df.columns:
         st.error(f"'{ipc_column}' 컬럼이 데이터프레임에 없습니다.")
@@ -443,7 +783,7 @@ def calculate_single_period_ipc(df, ipc_column, code_length, period_name):
     
     if len(df) == 0:
         # 빈 데이터프레임인 경우 빈 결과 반환
-        empty_node_df = pd.DataFrame(columns=['id', 'Name', 'Label'])
+        empty_node_df = pd.DataFrame(columns=['id', 'Name', 'Label', 'EC', 'BC', 'CC', 'Degree', 'Weighted_Degree'])
         empty_edge_df = pd.DataFrame(columns=['Source', 'Target', 'type', 'Weight'])
         return empty_edge_df, empty_node_df
     
@@ -457,7 +797,7 @@ def calculate_single_period_ipc(df, ipc_column, code_length, period_name):
     
     for idx in range(total_rows):
         if idx % 10 == 0:
-            progress = min(int((idx / total_rows) * 100), 100)  # 100을 초과하지 않도록 제한
+            progress = min(int((idx / total_rows) * 100), 100)
             progress_bar.progress(progress)
             status_text.text(f"{period_name} IPC 코드 처리 중... {idx}/{total_rows} 행 완료 ({progress}%)")
             
@@ -488,8 +828,15 @@ def calculate_single_period_ipc(df, ipc_column, code_length, period_name):
         'Label': unique_codes
     })
     
+    # 기본 중심성 지표를 0으로 초기화
+    node_df['EC'] = 0.0
+    node_df['BC'] = 0.0
+    node_df['CC'] = 0.0
+    node_df['Degree'] = 0
+    node_df['Weighted_Degree'] = 0.0
+    
     # 엣지 데이터 생성
-    if unique_codes:
+    if unique_codes and len(counter) > 0:
         ipc_to_id = dict(zip(unique_codes, node_df['id']))
         edges_data = []
         for (source, target), weight in counter.items():
@@ -499,16 +846,19 @@ def calculate_single_period_ipc(df, ipc_column, code_length, period_name):
         
         edge_df = pd.DataFrame(edges_data, columns=['Source', 'Target', 'type', 'Weight'])
         
-        # 중심성 지표 계산
+        # 중심성 지표 계산 (엣지가 있는 경우에만)
         if len(edge_df) > 0:
-            node_df_with_centrality = calculate_centrality_measures(edge_df, node_df)
+            try:
+                node_df_with_centrality = calculate_centrality_measures(edge_df, node_df)
+                return edge_df, node_df_with_centrality
+            except Exception as e:
+                st.warning(f"중심성 지표 계산 중 오류 발생: {e}")
+                return edge_df, node_df
         else:
-            node_df_with_centrality = node_df
+            return edge_df, node_df
     else:
         edge_df = pd.DataFrame(columns=['Source', 'Target', 'type', 'Weight'])
-        node_df_with_centrality = node_df
-    
-    return edge_df, node_df_with_centrality
+        return edge_df, node_df
 
 def calculate_entity_cooccurrence_timeseries(df, entity_column, entity_type="Entity", periods=None):
     """시계열을 고려한 발명자나 출원인 등의 엔티티 간 동시출현빈도를 계산합니다."""
@@ -545,13 +895,19 @@ def calculate_single_period_entity(df, entity_column, entity_type, period_name):
     all_combinations = []
     all_entities = []
     
+    if len(df) == 0:
+        # 빈 데이터프레임인 경우 빈 결과 반환
+        empty_node_df = pd.DataFrame(columns=['id', 'Name', 'Label', 'EC', 'BC', 'CC', 'Degree', 'Weighted_Degree'])
+        empty_edge_df = pd.DataFrame(columns=['Source', 'Target', 'type', 'Weight'])
+        return empty_edge_df, empty_node_df
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     total_rows = len(df)
     for idx, row in df.iterrows():
         if idx % 10 == 0:
-            progress = min(int((idx / total_rows) * 100), 100)  # 100을 초과하지 않도록 제한
+            progress = min(int((idx / total_rows) * 100), 100)
             progress_bar.progress(progress)
             status_text.text(f"{period_name} {entity_type} 처리 중... {idx}/{total_rows} 행 완료 ({progress}%)")
             
@@ -581,8 +937,15 @@ def calculate_single_period_entity(df, entity_column, entity_type, period_name):
         'Label': unique_entities
     })
     
+    # 기본 중심성 지표를 0으로 초기화
+    node_df['EC'] = 0.0
+    node_df['BC'] = 0.0
+    node_df['CC'] = 0.0
+    node_df['Degree'] = 0
+    node_df['Weighted_Degree'] = 0.0
+    
     # 엣지 데이터 생성
-    if unique_entities:
+    if unique_entities and len(counter) > 0:
         entity_to_id = dict(zip(unique_entities, node_df['id']))
         edges_data = []
         for (source, target), weight in counter.items():
@@ -592,16 +955,19 @@ def calculate_single_period_entity(df, entity_column, entity_type, period_name):
         
         edge_df = pd.DataFrame(edges_data, columns=['Source', 'Target', 'type', 'Weight'])
         
-        # 중심성 지표 계산
+        # 중심성 지표 계산 (엣지가 있는 경우에만)
         if len(edge_df) > 0:
-            node_df_with_centrality = calculate_centrality_measures(edge_df, node_df)
+            try:
+                node_df_with_centrality = calculate_centrality_measures(edge_df, node_df)
+                return edge_df, node_df_with_centrality
+            except Exception as e:
+                st.warning(f"중심성 지표 계산 중 오류 발생: {e}")
+                return edge_df, node_df
         else:
-            node_df_with_centrality = node_df
+            return edge_df, node_df
     else:
         edge_df = pd.DataFrame(columns=['Source', 'Target', 'type', 'Weight'])
-        node_df_with_centrality = node_df
-    
-    return edge_df, node_df_with_centrality
+        return edge_df, node_df
 
 def apply_label_mapping(node_df, mapping_file, code_length=4):
     """매핑 테이블을 사용하여 노드 데이터의 Label 컬럼을 업데이트합니다."""
@@ -798,7 +1164,33 @@ def display_period_comparison(results_dict, analysis_type):
         comparison_df = pd.DataFrame(comparison_data)
         st.dataframe(comparison_df)
 
-    # 메인 애플리케이션 로직
+def identify_monotonic_centrality_nodes(yearly_results, metric='EC', min_length=3):
+    from collections import defaultdict
+
+    node_trends = defaultdict(list)
+    sorted_years = sorted(yearly_results.keys())
+
+    for year in sorted_years:
+        df = yearly_results[year]
+        for _, row in df.iterrows():
+            node = row['Name']
+            value = row.get(metric, None)
+            if value is not None:
+                node_trends[node].append(value)
+
+    increasing = []
+    decreasing = []
+
+    for node, values in node_trends.items():
+        if len(values) >= min_length:
+            if all(earlier <= later for earlier, later in zip(values, values[1:])):
+                increasing.append((node, values))
+            elif all(earlier >= later for earlier, later in zip(values, values[1:])):
+                decreasing.append((node, values))
+
+    return increasing, decreasing
+
+# 메인 애플리케이션 로직
 def main():
     # 사이드바 설정
     st.sidebar.header("설정")
@@ -858,6 +1250,11 @@ def main():
         tab_names.append("발명자 분석")
     if analyze_applicant:
         tab_names.append("출원인 분석")
+    
+    # 새로운 시계열 중심성 분석 탭 추가
+    if enable_timeseries:
+        tab_names.append("중심성 추이 분석")
+        tab_names.append("구간별 변화 분석")
     
     # 탭 생성 및 딕셔너리에 저장
     tabs = st.tabs(tab_names)
@@ -970,6 +1367,7 @@ def main():
             
             # 분석 결과를 저장할 딕셔너리
             results = {}
+            yearly_centrality_results = {}
             
             with tabs_dict["분석 결과"]:
                 st.header("분석 진행 중...")
@@ -981,6 +1379,7 @@ def main():
                     # 4자리 IPC 코드
                     if enable_timeseries:
                         results['ipc_4'] = calculate_ipc_cooccurrence_timeseries(df, selected_columns['ipc'], code_length=4, periods=periods)
+                        yearly_centrality_results['ipc_4'] = calculate_yearly_centrality_analysis(df, selected_columns['ipc'], "IPC", code_length=4)
                     else:
                         edges_4, nodes_4 = calculate_single_period_ipc(df, selected_columns['ipc'], 4, "전체 기간")
                         results['ipc_4'] = {'전체 기간': {'edges': edges_4, 'nodes': nodes_4}}
@@ -988,6 +1387,7 @@ def main():
                     # 8자리 IPC 코드
                     if enable_timeseries:
                         results['ipc_8'] = calculate_ipc_cooccurrence_timeseries(df, selected_columns['ipc'], code_length=8, periods=periods)
+                        yearly_centrality_results['ipc_8'] = calculate_yearly_centrality_analysis(df, selected_columns['ipc'], "IPC", code_length=8)
                     else:
                         edges_8, nodes_8 = calculate_single_period_ipc(df, selected_columns['ipc'], 8, "전체 기간")
                         results['ipc_8'] = {'전체 기간': {'edges': edges_8, 'nodes': nodes_8}}
@@ -1010,6 +1410,7 @@ def main():
                     st.subheader("발명자 시계열 분석 중...")
                     if enable_timeseries:
                         results['inventor'] = calculate_entity_cooccurrence_timeseries(df, selected_columns['inventor'], "발명자", periods=periods)
+                        yearly_centrality_results['inventor'] = calculate_yearly_centrality_analysis(df, selected_columns['inventor'], "발명자")
                     else:
                         edges_inv, nodes_inv = calculate_single_period_entity(df, selected_columns['inventor'], "발명자", "전체 기간")
                         results['inventor'] = {'전체 기간': {'edges': edges_inv, 'nodes': nodes_inv}}
@@ -1019,6 +1420,7 @@ def main():
                     st.subheader("출원인 시계열 분석 중...")
                     if enable_timeseries:
                         results['applicant'] = calculate_entity_cooccurrence_timeseries(df, selected_columns['applicant'], "출원인", periods=periods)
+                        yearly_centrality_results['applicant'] = calculate_yearly_centrality_analysis(df, selected_columns['applicant'], "출원인")
                     else:
                         edges_app, nodes_app = calculate_single_period_entity(df, selected_columns['applicant'], "출원인", "전체 기간")
                         results['applicant'] = {'전체 기간': {'edges': edges_app, 'nodes': nodes_app}}
@@ -1125,6 +1527,120 @@ def main():
                             fig_applicant = create_timeseries_visualization(applicant_stats, "출원인", periods_info)
                             if fig_applicant:
                                 st.plotly_chart(fig_applicant, use_container_width=True)
+            
+            # 중심성 추이 분석 탭
+            if enable_timeseries and "중심성 추이 분석" in tabs_dict:
+                with tabs_dict["중심성 추이 분석"]:
+                    st.header("📈 중심성 지표 연도별 추이 분석")
+                    st.markdown("연도별 중심성 지표 변화를 추적하여 핵심 노드들의 영향력 변화를 분석합니다.")
+                    
+                    # 상위 N개 노드 선택 슬라이더
+                    if "top_n_nodes" not in st.session_state:
+                        st.session_state.top_n_nodes = 10
+
+                    top_n = st.slider("표시할 상위 노드 수", min_value=3, max_value=20, value=st.session_state.top_n_nodes, step=1)
+                    st.session_state.top_n_nodes = top_n
+                    
+                    if analyze_ipc and 'ipc_4' in yearly_centrality_results:
+                        st.subheader("🔬 4자리 IPC 코드 중심성 추이")
+                        if yearly_centrality_results['ipc_4']:
+                            fig_ipc4 = create_centrality_trend_visualization(yearly_centrality_results['ipc_4'], "4자리 IPC 코드", top_n)
+                            if fig_ipc4:
+                                st.plotly_chart(fig_ipc4, use_container_width=True)
+                        else:
+                            st.info("4자리 IPC 코드 연도별 중심성 데이터가 없습니다.")
+
+                    if analyze_ipc and 'ipc_8' in yearly_centrality_results:
+                        st.subheader("🔬 8자리 IPC 코드 중심성 추이")
+                        if yearly_centrality_results['ipc_8']:
+                            fig_ipc8 = create_centrality_trend_visualization(yearly_centrality_results['ipc_8'], "8자리 IPC 코드", top_n)
+                            if fig_ipc8:
+                                st.plotly_chart(fig_ipc8, use_container_width=True)
+                        else:
+                            st.info("8자리 IPC 코드 연도별 중심성 데이터가 없습니다.")
+
+                    # 중심성 추이 분석 - IPC 중심성 추세 노드 출력
+                    for ipc_level in ['ipc_4', 'ipc_8']:
+                        if ipc_level in yearly_centrality_results:
+                            entity_label = "4자리 IPC 코드" if ipc_level == 'ipc_4' else "8자리 IPC 코드"
+                            st.subheader(f"📊 {entity_label} 추세 분석")
+
+                            result = yearly_centrality_results[ipc_level]
+
+                            for metric in ['EC', 'BC', 'CC']:
+                                st.markdown(f"### `{metric}` 기준 추세 분석")
+                                inc_nodes, dec_nodes = identify_monotonic_centrality_nodes(result, metric)
+
+                                col1, col2 = st.columns(2)
+
+                                with col1:
+                                    st.markdown(f"**🔼 꾸준히 증가한 노드 (상위 10개)**")
+                                    if inc_nodes:
+                                        for node, values in inc_nodes[:10]:
+                                            trend_str = " → ".join(f"{v:.4f}" for v in values)
+                                            st.write(f"• {node}: {trend_str}")
+                                    else:
+                                        st.write("없음")
+
+                                with col2:
+                                    st.markdown(f"**🔽 꾸준히 감소한 노드 (상위 10개)**")
+                                    if dec_nodes:
+                                        for node, values in dec_nodes[:10]:
+                                            trend_str = " → ".join(f"{v:.4f}" for v in values)
+                                            st.write(f"• {node}: {trend_str}")
+                                    else:
+                                        st.write("없음")
+                    
+                    if analyze_inventor and 'inventor' in yearly_centrality_results:
+                        st.subheader("👨‍💼 발명자 중심성 추이")
+                        if yearly_centrality_results['inventor']:
+                            fig_inventor = create_centrality_trend_visualization(yearly_centrality_results['inventor'], "발명자", top_n)
+                            if fig_inventor:
+                                st.plotly_chart(fig_inventor, use_container_width=True)
+                        else:
+                            st.info("발명자 연도별 중심성 데이터가 없습니다.")
+                    
+                    if analyze_applicant and 'applicant' in yearly_centrality_results:
+                        st.subheader("🏢 출원인 중심성 추이")
+                        if yearly_centrality_results['applicant']:
+                            fig_applicant = create_centrality_trend_visualization(yearly_centrality_results['applicant'], "출원인", top_n)
+                            if fig_applicant:
+                                st.plotly_chart(fig_applicant, use_container_width=True)
+                        else:
+                            st.info("출원인 연도별 중심성 데이터가 없습니다.")
+            
+            # 구간별 변화 분석 탭
+            if enable_timeseries and "구간별 변화 분석" in tabs_dict:
+                with tabs_dict["구간별 변화 분석"]:
+                    st.header("🔄 구간별 변화 분석")
+                    st.markdown("설정한 구간들 간의 노드 등장/소멸 및 중심성 지표 변화를 분석합니다.")
+                    
+                    if len(periods) >= 1:
+                        # IPC 코드 구간별 변화 분석
+                        if analyze_ipc:
+                            # 4자리 IPC 코드
+                            st.subheader("🔬 4자리 IPC 코드 구간별 변화")
+                            changes_analysis_ipc4, centrality_changes_ipc4 = analyze_period_changes(results['ipc_4'], "4자리 IPC 코드")
+                            display_period_changes_analysis(changes_analysis_ipc4, centrality_changes_ipc4, "4자리 IPC 코드")
+                            
+                            # 8자리 IPC 코드
+                            st.subheader("🔬 8자리 IPC 코드 구간별 변화")
+                            changes_analysis_ipc8, centrality_changes_ipc8 = analyze_period_changes(results['ipc_8'], "8자리 IPC 코드")
+                            display_period_changes_analysis(changes_analysis_ipc8, centrality_changes_ipc8, "8자리 IPC 코드")
+                        
+                        # 발명자 구간별 변화 분석
+                        if analyze_inventor:
+                            st.subheader("👨‍💼 발명자 구간별 변화")
+                            changes_analysis_inv, centrality_changes_inv = analyze_period_changes(results['inventor'], "발명자")
+                            display_period_changes_analysis(changes_analysis_inv, centrality_changes_inv, "발명자")
+                        
+                        # 출원인 구간별 변화 분석
+                        if analyze_applicant:
+                            st.subheader("🏢 출원인 구간별 변화")
+                            changes_analysis_app, centrality_changes_app = analyze_period_changes(results['applicant'], "출원인")
+                            display_period_changes_analysis(changes_analysis_app, centrality_changes_app, "출원인")
+                    else:
+                        st.info("구간별 변화 분석을 위해서는 최소 1개 이상의 구간을 설정해주세요.")
             
             # 각 분석 결과 탭에 상세 정보 표시
             if analyze_ipc:
@@ -1333,6 +1849,11 @@ def main():
             - 특허 출원 트렌드 분석
             - 고유 엔티티 수 변화 추적
             - 구간별 하이라이트 표시
+            
+            **🆕 신규 추가 기능**:
+            - 📈 **중심성 추이 분석**: 연도별 중심성 지표 변화 시각화
+            - 🔄 **구간별 변화 분석**: 신규/소멸 노드 및 중심성 변화 추적
+            - 🎛️ **상위 N개 노드 조절**: 슬라이더로 표시할 노드 수 조정
             
             **출력 파일**: 구간별 독립 파일 생성
             - 각 구간에 대한 별도의 노드/엣지 파일
