@@ -14,21 +14,58 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, date
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from matplotlib import font_manager
+import seaborn as sns
 
 # 페이지 설정
 st.set_page_config(
-    page_title="특허 네트워크 분석 도구",
+    page_title="특허 네트워크 분석 및 시각화 도구",
     page_icon="📊",
     layout="wide"
 )
 
+# 한글 폰트 설정 (Matplotlib용)
+@st.cache_resource
+def setup_korean_font():
+    """한글 폰트 설정"""
+    try:
+        # 시스템에서 사용 가능한 한글 폰트 찾기
+        available_fonts = [f.name for f in font_manager.fontManager.ttflist]
+        korean_fonts = ['Malgun Gothic', 'NanumGothic', 'AppleGothic', 'Gulim', 'Dotum']
+        
+        for font in korean_fonts:
+            if font in available_fonts:
+                plt.rcParams['font.family'] = font
+                plt.rcParams['axes.unicode_minus'] = False
+                return font
+        
+        # 기본 폰트로 설정
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        return 'DejaVu Sans'
+    except:
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+        return 'DejaVu Sans'
+
 # 앱 제목 및 설명
-st.title("특허 네트워크 분석 도구")
+st.title("특허 네트워크 분석 및 시각화 도구")
 st.markdown("""
-이 도구는 특허 데이터에서 다음 항목들의 시계열 동시출현빈도를 분석하여 네트워크 분석용 파일을 생성합니다:
+이 도구는 특허 데이터에서 다음 항목들의 시계열 동시출현빈도를 분석하고 **네트워크 그래프를 시각화**합니다:
 - **IPC 코드** 동시출현빈도 (시계열 분석)
 - **발명자** 동시출현빈도 (시계열 분석)
 - **출원인** 동시출현빈도 (시계열 분석)
+
+**🆕 새로운 네트워크 시각화 기능**:
+- **인터랙티브 네트워크 그래프** (Plotly 기반)
+- **중심성 지표 기반 노드 크기/색상 조정**
+- **필터링 및 확대/축소 기능**
+- **노드/엣지 정보 호버 표시**
+- **네트워크 구조 비교 시각화**
+- **커뮤니티 탐지 및 시각화**
+- **네트워크 통계 대시보드**
 
 **중심성 지표 포함**:
 - **EC (Eigenvector Centrality)**: 고유벡터 중심성
@@ -46,7 +83,7 @@ st.markdown("""
 Gephi와 같은 네트워크 시각화 도구에서 사용할 수 있는 노드와 엣지 파일을 생성합니다.
 """)
 
-# 필요한 함수들 정의
+# 기본 유틸리티 함수들
 def parse_application_date(date_str):
     """
     출원일 문자열을 datetime 객체로 변환합니다.
@@ -287,6 +324,678 @@ def calculate_centrality_measures(edges_df, nodes_df):
     nodes_with_centrality['Weighted_Degree'] = nodes_with_centrality['id'].map(weighted_degree_dict)
     
     return nodes_with_centrality
+
+# 새로 추가된 네트워크 시각화 함수들
+def detect_communities(G):
+    """
+    커뮤니티 탐지를 수행합니다.
+    """
+    try:
+        import networkx.algorithms.community as nx_comm
+        communities = list(nx_comm.greedy_modularity_communities(G))
+        
+        # 노드별 커뮤니티 ID 매핑
+        node_community = {}
+        for i, community in enumerate(communities):
+            for node in community:
+                node_community[node] = i
+        
+        return node_community, communities
+    except:
+        # 커뮤니티 탐지 실패 시 모든 노드를 하나의 커뮤니티로 설정
+        return {node: 0 for node in G.nodes()}, [set(G.nodes())]
+
+def create_interactive_network_graph(edges_df, nodes_df, title="네트워크 그래프", 
+                                   node_size_metric='Degree', node_color_metric='EC',
+                                   max_nodes=100, min_edge_weight=1):
+    """
+    인터랙티브 네트워크 그래프를 생성합니다.
+    """
+    if len(edges_df) == 0 or len(nodes_df) == 0:
+        st.warning("시각화할 네트워크 데이터가 없습니다.")
+        return None
+    
+    # 엣지 가중치 필터링
+    filtered_edges = edges_df[edges_df['Weight'] >= min_edge_weight].copy()
+    
+    if len(filtered_edges) == 0:
+        st.warning(f"가중치 {min_edge_weight} 이상인 엣지가 없습니다.")
+        return None
+    
+    # 필터링된 엣지에 연결된 노드만 선택
+    connected_nodes = set(filtered_edges['Source'].tolist() + filtered_edges['Target'].tolist())
+    filtered_nodes = nodes_df[nodes_df['id'].isin(connected_nodes)].copy()
+    
+    # 노드 수 제한
+    if len(filtered_nodes) > max_nodes:
+        # 선택된 지표를 기준으로 상위 노드만 선택
+        if node_size_metric in filtered_nodes.columns:
+            top_nodes = filtered_nodes.nlargest(max_nodes, node_size_metric)
+        else:
+            top_nodes = filtered_nodes.head(max_nodes)
+        
+        top_node_ids = set(top_nodes['id'].tolist())
+        filtered_edges = filtered_edges[
+            (filtered_edges['Source'].isin(top_node_ids)) & 
+            (filtered_edges['Target'].isin(top_node_ids))
+        ]
+        filtered_nodes = top_nodes
+    
+    # NetworkX 그래프 생성
+    G = nx.Graph()
+    
+    # 노드 추가
+    for _, node in filtered_nodes.iterrows():
+        G.add_node(node['id'], **node.to_dict())
+    
+    # 엣지 추가
+    for _, edge in filtered_edges.iterrows():
+        if edge['Source'] in G.nodes() and edge['Target'] in G.nodes():
+            G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+    
+    if len(G.nodes()) == 0:
+        st.warning("표시할 노드가 없습니다.")
+        return None
+    
+    # 커뮤니티 탐지
+    node_community, communities = detect_communities(G)
+    
+    # 레이아웃 계산
+    try:
+        # Spring layout 사용 (노드가 많으면 시간이 오래 걸릴 수 있음)
+        if len(G.nodes()) <= 50:
+            pos = nx.spring_layout(G, k=3, iterations=50, seed=42)
+        else:
+            pos = nx.spring_layout(G, k=1, iterations=30, seed=42)
+    except:
+        # Fallback으로 random layout 사용
+        pos = nx.random_layout(G, seed=42)
+    
+    # 노드 위치 및 속성 추출
+    node_x = []
+    node_y = []
+    node_text = []
+    node_info = []
+    node_sizes = []
+    node_colors = []
+    
+    for node_id in G.nodes():
+        x, y = pos[node_id]
+        node_x.append(x)
+        node_y.append(y)
+        
+        node_data = G.nodes[node_id]
+        name = node_data.get('Name', str(node_id))
+        label = node_data.get('Label', name)
+        
+        # 호버 정보 생성
+        hover_info = f"<b>{name}</b><br>"
+        hover_info += f"Label: {label}<br>"
+        hover_info += f"Community: {node_community.get(node_id, 0)}<br>"
+        
+        for metric in ['EC', 'BC', 'CC', 'Degree', 'Weighted_Degree']:
+            if metric in node_data:
+                hover_info += f"{metric}: {node_data[metric]:.4f}<br>"
+        
+        node_text.append(label[:20] + '...' if len(label) > 20 else label)
+        node_info.append(hover_info)
+        
+        # 노드 크기 설정
+        if node_size_metric in node_data and pd.notna(node_data[node_size_metric]):
+            size_value = node_data[node_size_metric]
+        else:
+            size_value = 1
+        node_sizes.append(max(size_value * 50, 5))  # 최소 크기 5
+        
+        # 노드 색상 설정
+        if node_color_metric in node_data and pd.notna(node_data[node_color_metric]):
+            color_value = node_data[node_color_metric]
+        else:
+            color_value = node_community.get(node_id, 0)
+        node_colors.append(color_value)
+    
+    # 엣지 위치 추출
+    edge_x = []
+    edge_y = []
+    edge_info = []
+    edge_weights = []
+    
+    for edge in G.edges():
+        x0, y0 = pos[edge[0]]
+        x1, y1 = pos[edge[1]]
+        edge_x.extend([x0, x1, None])
+        edge_y.extend([y0, y1, None])
+        
+        weight = G.edges[edge].get('weight', 1)
+        edge_weights.append(weight)
+        
+        # 엣지 정보
+        source_name = G.nodes[edge[0]].get('Name', str(edge[0]))
+        target_name = G.nodes[edge[1]].get('Name', str(edge[1]))
+        edge_info.append(f"{source_name} ↔ {target_name}<br>Weight: {weight}")
+    
+    # Plotly 그래프 생성
+    fig = go.Figure()
+    
+    # 엣지 추가
+    fig.add_trace(go.Scatter(
+        x=edge_x, y=edge_y,
+        line=dict(width=0.5, color='rgba(125,125,125,0.5)'),
+        hoverinfo='none',
+        mode='lines',
+        name='연결'
+    ))
+    
+    # 노드 추가
+    fig.add_trace(go.Scatter(
+        x=node_x, y=node_y,
+        mode='markers+text',
+        hoverinfo='text',
+        text=node_text,
+        textposition="middle center",
+        hovertext=node_info,
+        marker=dict(
+            size=node_sizes,
+            color=node_colors,
+            colorscale='Viridis',
+            colorbar=dict(
+                title=dict(text=node_color_metric, side="right"),
+                tickmode="linear"
+            ),
+            line=dict(width=0.5, color='rgba(50,50,50,0.5)')
+        ),
+        name='노드'
+    ))
+    
+    # 레이아웃 설정
+    fig.update_layout(
+        title=dict(
+            text=title,
+            x=0.5,
+            font=dict(size=16)
+        ),
+        showlegend=False,
+        hovermode='closest',
+        margin=dict(b=20,l=5,r=5,t=40),
+        annotations=[
+            dict(
+                text=f"노드 수: {len(G.nodes())}, 엣지 수: {len(G.edges())}<br>" +
+                     f"노드 크기: {node_size_metric}, 노드 색상: {node_color_metric}",
+                showarrow=False,
+                xref="paper", yref="paper",
+                x=0.005, y=-0.002,
+                xanchor='left', yanchor='bottom',
+                font=dict(size=10)
+            )
+        ],
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        height=600
+    )
+    
+    return fig
+
+def create_network_comparison_graph(results_dict, analysis_type, node_size_metric='Degree', 
+                                  node_color_metric='EC', max_nodes=50):
+    """
+    여러 기간의 네트워크를 비교 시각화합니다.
+    """
+    if len(results_dict) <= 1:
+        st.warning("비교할 기간이 부족합니다.")
+        return None
+    
+    period_names = list(results_dict.keys())
+    n_periods = len(period_names)
+    
+    # 서브플롯 설정
+    if n_periods == 2:
+        rows, cols = 1, 2
+    elif n_periods == 3:
+        rows, cols = 1, 3
+    elif n_periods == 4:
+        rows, cols = 2, 2
+    else:
+        rows, cols = 2, 3
+    
+    fig = make_subplots(
+        rows=rows, cols=cols,
+        subplot_titles=period_names,
+        specs=[[{"type": "scatter"}] * cols for _ in range(rows)]
+    )
+    
+    colors = px.colors.qualitative.Set1
+    
+    for idx, (period_name, result) in enumerate(results_dict.items()):
+        row = idx // cols + 1
+        col = idx % cols + 1
+        
+        edges_df = result['edges']
+        nodes_df = result['nodes']
+        
+        if len(edges_df) == 0 or len(nodes_df) == 0:
+            continue
+        
+        # 상위 노드만 선택
+        if len(nodes_df) > max_nodes:
+            if node_size_metric in nodes_df.columns:
+                top_nodes = nodes_df.nlargest(max_nodes, node_size_metric)
+            else:
+                top_nodes = nodes_df.head(max_nodes)
+            
+            top_node_ids = set(top_nodes['id'].tolist())
+            filtered_edges = edges_df[
+                (edges_df['Source'].isin(top_node_ids)) & 
+                (edges_df['Target'].isin(top_node_ids))
+            ]
+            filtered_nodes = top_nodes
+        else:
+            filtered_edges = edges_df
+            filtered_nodes = nodes_df
+        
+        # NetworkX 그래프 생성
+        G = nx.Graph()
+        
+        for _, node in filtered_nodes.iterrows():
+            G.add_node(node['id'], **node.to_dict())
+        
+        for _, edge in filtered_edges.iterrows():
+            if edge['Source'] in G.nodes() and edge['Target'] in G.nodes():
+                G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+        
+        if len(G.nodes()) == 0:
+            continue
+        
+        # 레이아웃 계산
+        try:
+            pos = nx.spring_layout(G, k=2, iterations=30, seed=42)
+        except:
+            pos = nx.random_layout(G, seed=42)
+        
+        # 엣지 그리기
+        edge_x = []
+        edge_y = []
+        for edge in G.edges():
+            x0, y0 = pos[edge[0]]
+            x1, y1 = pos[edge[1]]
+            edge_x.extend([x0, x1, None])
+            edge_y.extend([y0, y1, None])
+        
+        fig.add_trace(go.Scatter(
+            x=edge_x, y=edge_y,
+            line=dict(width=0.5, color='rgba(125,125,125,0.3)'),
+            hoverinfo='none',
+            mode='lines',
+            showlegend=False
+        ), row=row, col=col)
+        
+        # 노드 그리기
+        node_x = []
+        node_y = []
+        node_sizes = []
+        node_colors = []
+        node_text = []
+        
+        for node_id in G.nodes():
+            x, y = pos[node_id]
+            node_x.append(x)
+            node_y.append(y)
+            
+            node_data = G.nodes[node_id]
+            name = node_data.get('Name', str(node_id))
+            node_text.append(name[:10] + '...' if len(name) > 10 else name)
+            
+            # 노드 크기
+            if node_size_metric in node_data and pd.notna(node_data[node_size_metric]):
+                size_value = node_data[node_size_metric]
+            else:
+                size_value = 1
+            node_sizes.append(max(size_value * 30, 3))
+            
+            # 노드 색상
+            if node_color_metric in node_data and pd.notna(node_data[node_color_metric]):
+                color_value = node_data[node_color_metric]
+            else:
+                color_value = 0
+            node_colors.append(color_value)
+        
+        fig.add_trace(go.Scatter(
+            x=node_x, y=node_y,
+            mode='markers+text',
+            text=node_text,
+            textposition="middle center",
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                colorscale='Viridis',
+                line=dict(width=0.5, color='rgba(50,50,50,0.5)')
+            ),
+            showlegend=False
+        ), row=row, col=col)
+        
+        # 축 설정
+        fig.update_xaxes(showgrid=False, zeroline=False, showticklabels=False, row=row, col=col)
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, row=row, col=col)
+    
+    fig.update_layout(
+        title=f"{analysis_type} 구간별 네트워크 비교",
+        height=400 * rows,
+        showlegend=False
+    )
+    
+    return fig
+
+def create_network_statistics_dashboard(results_dict, analysis_type):
+    """
+    네트워크 통계 대시보드를 생성합니다.
+    """
+    if not results_dict:
+        return None
+    
+    # 통계 데이터 수집
+    stats_data = []
+    
+    for period_name, result in results_dict.items():
+        edges_df = result['edges']
+        nodes_df = result['nodes']
+        
+        if len(nodes_df) == 0:
+            continue
+        
+        # NetworkX 그래프 생성
+        G = nx.Graph()
+        
+        for _, node in nodes_df.iterrows():
+            G.add_node(node['id'])
+        
+        for _, edge in edges_df.iterrows():
+            if edge['Source'] in G.nodes() and edge['Target'] in G.nodes():
+                G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+        
+        # 네트워크 기본 통계
+        num_nodes = len(G.nodes())
+        num_edges = len(G.edges())
+        density = nx.density(G) if num_nodes > 1 else 0
+        
+        # 연결성 통계
+        if num_edges > 0:
+            components = list(nx.connected_components(G))
+            largest_component_size = len(max(components, key=len))
+            avg_clustering = nx.average_clustering(G)
+            
+            # 최단 경로 길이 (가장 큰 컴포넌트에서만)
+            if largest_component_size > 1:
+                largest_cc = G.subgraph(max(components, key=len))
+                try:
+                    avg_path_length = nx.average_shortest_path_length(largest_cc)
+                except:
+                    avg_path_length = 0
+            else:
+                avg_path_length = 0
+        else:
+            largest_component_size = 0
+            avg_clustering = 0
+            avg_path_length = 0
+        
+        # 중심성 통계
+        if 'EC' in nodes_df.columns:
+            avg_ec = nodes_df['EC'].mean()
+            max_ec = nodes_df['EC'].max()
+        else:
+            avg_ec = max_ec = 0
+        
+        if 'BC' in nodes_df.columns:
+            avg_bc = nodes_df['BC'].mean()
+            max_bc = nodes_df['BC'].max()
+        else:
+            avg_bc = max_bc = 0
+        
+        if 'CC' in nodes_df.columns:
+            avg_cc = nodes_df['CC'].mean()
+            max_cc = nodes_df['CC'].max()
+        else:
+            avg_cc = max_cc = 0
+        
+        stats_data.append({
+            '구간': period_name,
+            '노드 수': num_nodes,
+            '엣지 수': num_edges,
+            '밀도': density,
+            '최대 컴포넌트 크기': largest_component_size,
+            '평균 클러스터링': avg_clustering,
+            '평균 최단경로': avg_path_length,
+            '평균 EC': avg_ec,
+            '최대 EC': max_ec,
+            '평균 BC': avg_bc,
+            '최대 BC': max_bc,
+            '평균 CC': avg_cc,
+            '최대 CC': max_cc
+        })
+    
+    if not stats_data:
+        return None
+    
+    stats_df = pd.DataFrame(stats_data)
+    
+    # 서브플롯 생성
+    fig = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[
+            '노드/엣지 수', '네트워크 밀도', '클러스터링 계수',
+            '평균 고유벡터 중심성', '평균 매개 중심성', '평균 근접 중심성'
+        ],
+        specs=[[{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}]]
+    )
+    
+    # 1. 노드/엣지 수
+    fig.add_trace(
+        go.Bar(x=stats_df['구간'], y=stats_df['노드 수'], name='노드 수', marker_color='lightblue'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Bar(x=stats_df['구간'], y=stats_df['엣지 수'], name='엣지 수', marker_color='lightcoral'),
+        row=1, col=1
+    )
+    
+    # 2. 네트워크 밀도
+    fig.add_trace(
+        go.Scatter(x=stats_df['구간'], y=stats_df['밀도'], mode='lines+markers', 
+                  name='밀도', line=dict(color='green')),
+        row=1, col=2
+    )
+    
+    # 3. 클러스터링 계수
+    fig.add_trace(
+        go.Scatter(x=stats_df['구간'], y=stats_df['평균 클러스터링'], mode='lines+markers',
+                  name='클러스터링', line=dict(color='purple')),
+        row=1, col=3
+    )
+    
+    # 4. 평균 고유벡터 중심성
+    fig.add_trace(
+        go.Bar(x=stats_df['구간'], y=stats_df['평균 EC'], name='평균 EC', marker_color='orange'),
+        row=2, col=1
+    )
+    
+    # 5. 평균 매개 중심성
+    fig.add_trace(
+        go.Bar(x=stats_df['구간'], y=stats_df['평균 BC'], name='평균 BC', marker_color='red'),
+        row=2, col=2
+    )
+    
+    # 6. 평균 근접 중심성
+    fig.add_trace(
+        go.Bar(x=stats_df['구간'], y=stats_df['평균 CC'], name='평균 CC', marker_color='blue'),
+        row=2, col=3
+    )
+    
+    fig.update_layout(
+        title=f'{analysis_type} 네트워크 통계 대시보드',
+        showlegend=False,
+        height=600
+    )
+    
+    return fig, stats_df
+
+def create_centrality_distribution_plot(nodes_df, title="중심성 지표 분포"):
+    """
+    중심성 지표들의 분포를 시각화합니다.
+    """
+    if len(nodes_df) == 0:
+        return None
+    
+    centrality_metrics = ['EC', 'BC', 'CC']
+    available_metrics = [metric for metric in centrality_metrics if metric in nodes_df.columns]
+    
+    if not available_metrics:
+        st.warning("중심성 지표가 없습니다.")
+        return None
+    
+    fig = make_subplots(
+        rows=1, cols=len(available_metrics),
+        subplot_titles=[f'{metric} 분포' for metric in available_metrics]
+    )
+    
+    colors = ['blue', 'red', 'green']
+    
+    for i, metric in enumerate(available_metrics):
+        values = nodes_df[metric].dropna()
+        
+        if len(values) == 0:
+            continue
+        
+        # 히스토그램
+        fig.add_trace(
+            go.Histogram(
+                x=values,
+                name=f'{metric} 분포',
+                marker_color=colors[i % len(colors)],
+                opacity=0.7,
+                nbinsx=20
+            ),
+            row=1, col=i+1
+        )
+        
+        # 통계 정보 추가
+        mean_val = values.mean()
+        median_val = values.median()
+        
+        fig.add_vline(
+            x=mean_val, line_dash="dash", line_color="red",
+            annotation_text=f"평균: {mean_val:.4f}",
+            row=1, col=i+1
+        )
+        
+        fig.add_vline(
+            x=median_val, line_dash="dot", line_color="blue",
+            annotation_text=f"중앙값: {median_val:.4f}",
+            row=1, col=i+1
+        )
+    
+    fig.update_layout(
+        title=title,
+        showlegend=False,
+        height=400
+    )
+    
+    return fig
+
+def create_degree_distribution_plot(nodes_df, title="연결도 분포"):
+    """
+    노드의 연결도 분포를 시각화합니다.
+    """
+    if len(nodes_df) == 0 or 'Degree' not in nodes_df.columns:
+        return None
+    
+    degrees = nodes_df['Degree'].values
+    degree_counts = Counter(degrees)
+    
+    x_vals = list(degree_counts.keys())
+    y_vals = list(degree_counts.values())
+    
+    fig = go.Figure()
+    
+    # 막대 그래프
+    fig.add_trace(go.Bar(
+        x=x_vals,
+        y=y_vals,
+        name='연결도 분포',
+        marker_color='lightblue'
+    ))
+    
+    # 로그 스케일 옵션
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=y_vals,
+        mode='lines+markers',
+        name='연결도 분포 (선형)',
+        line=dict(color='red'),
+        visible='legendonly'
+    ))
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title='연결도 (Degree)',
+        yaxis_title='노드 수',
+        showlegend=True,
+        height=400
+    )
+    
+    return fig
+
+def extract_network_insights(edges_df, nodes_df, analysis_type):
+    """
+    네트워크에서 주요 인사이트를 추출합니다.
+    """
+    if len(nodes_df) == 0:
+        return {}
+    
+    insights = {}
+    
+    # 1. 가장 중요한 노드들 (각 중심성 기준)
+    centrality_metrics = ['EC', 'BC', 'CC', 'Degree', 'Weighted_Degree']
+    
+    for metric in centrality_metrics:
+        if metric in nodes_df.columns:
+            top_node = nodes_df.loc[nodes_df[metric].idxmax()]
+            insights[f'top_{metric.lower()}'] = {
+                'name': top_node['Name'],
+                'label': top_node.get('Label', top_node['Name']),
+                'value': top_node[metric]
+            }
+    
+    # 2. 네트워크 구조 특성
+    if len(edges_df) > 0:
+        # NetworkX 그래프 생성
+        G = nx.Graph()
+        
+        for _, node in nodes_df.iterrows():
+            G.add_node(node['id'])
+        
+        for _, edge in edges_df.iterrows():
+            G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+        
+        # 기본 통계
+        insights['network_stats'] = {
+            'nodes': len(G.nodes()),
+            'edges': len(G.edges()),
+            'density': nx.density(G),
+            'components': nx.number_connected_components(G)
+        }
+        
+        # 가장 강한 연결
+        if len(edges_df) > 0:
+            strongest_edge = edges_df.loc[edges_df['Weight'].idxmax()]
+            source_name = nodes_df.loc[nodes_df['id'] == strongest_edge['Source'], 'Name'].iloc[0]
+            target_name = nodes_df.loc[nodes_df['id'] == strongest_edge['Target'], 'Name'].iloc[0]
+            
+            insights['strongest_connection'] = {
+                'source': source_name,
+                'target': target_name,
+                'weight': strongest_edge['Weight']
+            }
+    
+    return insights
 
 def calculate_timeseries_stats(df, date_column, entity_column, entity_type="Entity"):
     """
@@ -1192,12 +1901,19 @@ def identify_monotonic_centrality_nodes(yearly_results, metric='EC', min_length=
 
 # 메인 애플리케이션 로직
 def main():
+    # 한글 폰트 설정
+    setup_korean_font()
+    
     # 사이드바 설정
     st.sidebar.header("설정")
     
     # 파일 업로드 섹션
     st.sidebar.subheader("1. 데이터 파일 업로드")
-    uploaded_file = st.sidebar.file_uploader("Excel 특허 데이터 파일을 업로드하세요", type=["xlsx", "xls"])
+    uploaded_file = st.sidebar.file_uploader(
+        "Excel 특허 데이터 파일을 업로드하세요", 
+        type=["xlsx", "xls"],
+        key="main_patent_data_file"  # 고유한 키 추가
+    )
     
     # 분석 옵션 선택
     st.sidebar.subheader("2. 분석 옵션 선택")
@@ -1233,16 +1949,41 @@ def main():
                 else:
                     st.sidebar.error(f"{period_name}: 시작년도가 종료년도보다 클 수 없습니다.")
     
+    # 네트워크 시각화 옵션
+    st.sidebar.subheader("5. 🆕 네트워크 시각화 설정")
+    enable_network_viz = st.sidebar.checkbox("네트워크 시각화 활성화", value=True)
+    
+    if enable_network_viz:
+        max_nodes = st.sidebar.slider("최대 노드 수", min_value=20, max_value=200, value=100, step=10)
+        min_edge_weight = st.sidebar.slider("최소 엣지 가중치", min_value=1, max_value=10, value=1, step=1)
+        
+        node_size_options = ['Degree', 'Weighted_Degree', 'EC', 'BC', 'CC']
+        node_size_metric = st.sidebar.selectbox("노드 크기 기준", node_size_options, index=0)
+        
+        node_color_options = ['EC', 'BC', 'CC', 'Degree', 'Community']
+        node_color_metric = st.sidebar.selectbox("노드 색상 기준", node_color_options, index=0)
+    
     # 매핑 파일 업로드 섹션
-    st.sidebar.subheader("5. 레이블 매핑 파일 (선택사항)")
-    uploaded_mapping_4chars = st.sidebar.file_uploader("4자리 IPC 코드 매핑 파일 (선택사항)", type=["xlsx", "xls"])
-    uploaded_mapping_8chars = st.sidebar.file_uploader("8자리 IPC 코드 매핑 파일 (선택사항)", type=["xlsx", "xls"])
+    st.sidebar.subheader("6. 레이블 매핑 파일 (선택사항)")
+    uploaded_mapping_4chars = st.sidebar.file_uploader(
+        "4자리 IPC 코드 매핑 파일 (선택사항)", 
+        type=["xlsx", "xls"], 
+        key="mapping_4chars_file"
+    )
+    uploaded_mapping_8chars = st.sidebar.file_uploader(
+        "8자리 IPC 코드 매핑 파일 (선택사항)", 
+        type=["xlsx", "xls"], 
+        key="mapping_8chars_file"
+    )
     
     # 처리 버튼
     process_button = st.sidebar.button("분석 시작", type="primary")
     
     # 메인 화면 레이아웃 - 탭 구성
     tab_names = ["분석 결과", "시계열 대시보드"]
+    
+    if enable_network_viz:
+        tab_names.append("🆕 네트워크 시각화")
     
     if analyze_ipc:
         tab_names.extend(["4자리 IPC 코드", "8자리 IPC 코드"])
@@ -1495,6 +2236,143 @@ def main():
                 download_link = create_zip_file(files_dict)
                 st.markdown(download_link, unsafe_allow_html=True)
             
+            # 🆕 네트워크 시각화 탭
+            if enable_network_viz and "🆕 네트워크 시각화" in tabs_dict:
+                with tabs_dict["🆕 네트워크 시각화"]:
+                    st.header("🕸️ 인터랙티브 네트워크 시각화")
+                    st.markdown("네트워크 구조를 인터랙티브하게 탐색할 수 있습니다. 노드를 클릭하여 상세 정보를 확인하고, 확대/축소 및 드래그를 통해 네트워크를 탐색하세요.")
+                    
+                    # 분석 유형 선택
+                    available_analyses = []
+                    if analyze_ipc:
+                        available_analyses.extend(["4자리 IPC 코드", "8자리 IPC 코드"])
+                    if analyze_inventor:
+                        available_analyses.append("발명자")
+                    if analyze_applicant:
+                        available_analyses.append("출원인")
+                    
+                    if available_analyses:
+                        selected_analysis = st.selectbox("분석 유형 선택", available_analyses)
+                        
+                        # 해당 분석 결과 가져오기
+                        if selected_analysis == "4자리 IPC 코드":
+                            current_results = results.get('ipc_4', {})
+                        elif selected_analysis == "8자리 IPC 코드":
+                            current_results = results.get('ipc_8', {})
+                        elif selected_analysis == "발명자":
+                            current_results = results.get('inventor', {})
+                        elif selected_analysis == "출원인":
+                            current_results = results.get('applicant', {})
+                        else:
+                            current_results = {}
+                        
+                        if current_results:
+                            # 기간 선택
+                            available_periods = list(current_results.keys())
+                            selected_period = st.selectbox("기간 선택", available_periods)
+                            
+                            if selected_period in current_results:
+                                edges_df = current_results[selected_period]['edges']
+                                nodes_df = current_results[selected_period]['nodes']
+                                
+                                # 네트워크 시각화 설정
+                                col1, col2, col3 = st.columns(3)
+                                
+                                with col1:
+                                    viz_max_nodes = st.slider("표시할 최대 노드 수", 20, 200, max_nodes, key="viz_max_nodes")
+                                
+                                with col2:
+                                    viz_min_edge_weight = st.slider("최소 엣지 가중치", 1, 20, min_edge_weight, key="viz_min_edge")
+                                
+                                with col3:
+                                    show_statistics = st.checkbox("네트워크 통계 표시", value=True)
+                                
+                                # 인터랙티브 네트워크 그래프 생성
+                                if len(edges_df) > 0 and len(nodes_df) > 0:
+                                    fig = create_interactive_network_graph(
+                                        edges_df, nodes_df, 
+                                        title=f"{selected_analysis} - {selected_period} 네트워크",
+                                        node_size_metric=node_size_metric,
+                                        node_color_metric=node_color_metric,
+                                        max_nodes=viz_max_nodes,
+                                        min_edge_weight=viz_min_edge_weight
+                                    )
+                                    
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # 네트워크 통계 표시
+                                    if show_statistics:
+                                        st.subheader("📊 네트워크 통계")
+                                        
+                                        # 기본 통계
+                                        col1, col2, col3, col4 = st.columns(4)
+                                        with col1:
+                                            st.metric("총 노드 수", len(nodes_df))
+                                        with col2:
+                                            st.metric("총 엣지 수", len(edges_df))
+                                        with col3:
+                                            density = len(edges_df) / (len(nodes_df) * (len(nodes_df) - 1) / 2) if len(nodes_df) > 1 else 0
+                                            st.metric("네트워크 밀도", f"{density:.4f}")
+                                        with col4:
+                                            avg_degree = nodes_df['Degree'].mean() if 'Degree' in nodes_df.columns else 0
+                                            st.metric("평균 연결도", f"{avg_degree:.2f}")
+                                        
+                                        # 중심성 분포 그래프
+                                        if 'EC' in nodes_df.columns:
+                                            fig_centrality = create_centrality_distribution_plot(nodes_df, f"{selected_analysis} - {selected_period} 중심성 분포")
+                                            if fig_centrality:
+                                                st.plotly_chart(fig_centrality, use_container_width=True)
+                                        
+                                        # 연결도 분포 그래프
+                                        if 'Degree' in nodes_df.columns:
+                                            fig_degree = create_degree_distribution_plot(nodes_df, f"{selected_analysis} - {selected_period} 연결도 분포")
+                                            if fig_degree:
+                                                st.plotly_chart(fig_degree, use_container_width=True)
+                                        
+                                        # 네트워크 인사이트
+                                        insights = extract_network_insights(edges_df, nodes_df, selected_analysis)
+                                        
+                                        if insights:
+                                            st.subheader("🔍 주요 인사이트")
+                                            
+                                            if 'top_ec' in insights:
+                                                st.write(f"**가장 영향력 있는 노드 (EC):** {insights['top_ec']['label']} (점수: {insights['top_ec']['value']:.4f})")
+                                            
+                                            if 'top_bc' in insights:
+                                                st.write(f"**가장 중요한 중개자 (BC):** {insights['top_bc']['label']} (점수: {insights['top_bc']['value']:.4f})")
+                                            
+                                            if 'strongest_connection' in insights:
+                                                st.write(f"**가장 강한 연결:** {insights['strongest_connection']['source']} ↔ {insights['strongest_connection']['target']} (가중치: {insights['strongest_connection']['weight']})")
+                                
+                                else:
+                                    st.info("시각화할 네트워크 데이터가 없습니다.")
+                        
+                        # 구간별 네트워크 비교 (구간이 여러 개인 경우)
+                        if len(current_results) > 1:
+                            st.subheader("🔄 구간별 네트워크 비교")
+                            
+                            # 네트워크 통계 대시보드
+                            stats_fig, stats_df = create_network_statistics_dashboard(current_results, selected_analysis)
+                            if stats_fig:
+                                st.plotly_chart(stats_fig, use_container_width=True)
+                                
+                                with st.expander("네트워크 통계 데이터 보기"):
+                                    st.dataframe(stats_df)
+                            
+                            # 구간별 네트워크 비교 시각화
+                            comparison_fig = create_network_comparison_graph(
+                                current_results, selected_analysis,
+                                node_size_metric=node_size_metric,
+                                node_color_metric=node_color_metric,
+                                max_nodes=50
+                            )
+                            
+                            if comparison_fig:
+                                st.plotly_chart(comparison_fig, use_container_width=True)
+                    else:
+                        st.info("분석 결과가 없습니다. 먼저 분석을 실행해주세요.")
+            
             # 시계열 대시보드 탭
             if enable_timeseries:
                 with tabs_dict["시계열 대시보드"]:
@@ -1656,6 +2534,17 @@ def main():
                         edges_df = result['edges']
                         
                         if len(nodes_df) > 0:
+                            # 네트워크 시각화 (간단한 버전)
+                            if enable_network_viz and len(edges_df) > 0:
+                                with st.expander(f"{period_name} 네트워크 시각화 보기"):
+                                    fig_simple = create_interactive_network_graph(
+                                        edges_df, nodes_df, 
+                                        title=f"4자리 IPC 코드 - {period_name}",
+                                        max_nodes=50, min_edge_weight=1
+                                    )
+                                    if fig_simple:
+                                        st.plotly_chart(fig_simple, use_container_width=True)
+                            
                             # 중심성 지표 상위 노드들 표시
                             if calculate_centrality and 'EC' in nodes_df.columns:
                                 col1, col2, col3 = st.columns(3)
@@ -1696,6 +2585,17 @@ def main():
                         edges_df = result['edges']
                         
                         if len(nodes_df) > 0:
+                            # 네트워크 시각화 (간단한 버전)
+                            if enable_network_viz and len(edges_df) > 0:
+                                with st.expander(f"{period_name} 네트워크 시각화 보기"):
+                                    fig_simple = create_interactive_network_graph(
+                                        edges_df, nodes_df, 
+                                        title=f"8자리 IPC 코드 - {period_name}",
+                                        max_nodes=50, min_edge_weight=1
+                                    )
+                                    if fig_simple:
+                                        st.plotly_chart(fig_simple, use_container_width=True)
+                            
                             # 중심성 지표 상위 노드들 표시
                             if calculate_centrality and 'EC' in nodes_df.columns:
                                 col1, col2, col3 = st.columns(3)
@@ -1737,6 +2637,17 @@ def main():
                         edges_df = result['edges']
                         
                         if len(nodes_df) > 0:
+                            # 네트워크 시각화 (간단한 버전)
+                            if enable_network_viz and len(edges_df) > 0:
+                                with st.expander(f"{period_name} 네트워크 시각화 보기"):
+                                    fig_simple = create_interactive_network_graph(
+                                        edges_df, nodes_df, 
+                                        title=f"발명자 - {period_name}",
+                                        max_nodes=50, min_edge_weight=1
+                                    )
+                                    if fig_simple:
+                                        st.plotly_chart(fig_simple, use_container_width=True)
+                            
                             # 중심성 지표 상위 노드들 표시
                             if calculate_centrality and 'EC' in nodes_df.columns:
                                 col1, col2, col3 = st.columns(3)
@@ -1778,6 +2689,17 @@ def main():
                         edges_df = result['edges']
                         
                         if len(nodes_df) > 0:
+                            # 네트워크 시각화 (간단한 버전)
+                            if enable_network_viz and len(edges_df) > 0:
+                                with st.expander(f"{period_name} 네트워크 시각화 보기"):
+                                    fig_simple = create_interactive_network_graph(
+                                        edges_df, nodes_df, 
+                                        title=f"출원인 - {period_name}",
+                                        max_nodes=50, min_edge_weight=1
+                                    )
+                                    if fig_simple:
+                                        st.plotly_chart(fig_simple, use_container_width=True)
+                            
                             # 중심성 지표 상위 노드들 표시
                             if calculate_centrality and 'EC' in nodes_df.columns:
                                 col1, col2, col3 = st.columns(3)
@@ -1850,10 +2772,33 @@ def main():
             - 고유 엔티티 수 변화 추적
             - 구간별 하이라이트 표시
             
-            **🆕 신규 추가 기능**:
+            ### 🆕 새로운 네트워크 시각화 기능
+            
+            **인터랙티브 네트워크 그래프**:
+            - 노드와 엣지를 클릭하여 상세 정보 확인
+            - 확대/축소 및 드래그를 통한 자유로운 탐색
+            - 중심성 지표에 따른 노드 크기/색상 조정
+            
+            **네트워크 통계 대시보드**:
+            - 구간별 네트워크 밀도, 클러스터링 계수 등 비교
+            - 중심성 지표 분포 히스토그램
+            - 연결도 분포 및 네트워크 인사이트
+            
+            **커뮤니티 탐지**:
+            - 자동 커뮤니티 탐지 및 시각화
+            - 커뮤니티별 색상 구분
+            - 네트워크 구조 패턴 분석
+            
+            **구간별 네트워크 비교**:
+            - 여러 시기의 네트워크를 한 번에 비교
+            - 시계열 네트워크 구조 변화 추적
+            - 네트워크 진화 패턴 분석
+            
+            **🎛️ 고급 설정 기능**:
             - 📈 **중심성 추이 분석**: 연도별 중심성 지표 변화 시각화
             - 🔄 **구간별 변화 분석**: 신규/소멸 노드 및 중심성 변화 추적
-            - 🎛️ **상위 N개 노드 조절**: 슬라이더로 표시할 노드 수 조정
+            - 🎚️ **시각화 옵션 조절**: 노드 수, 엣지 가중치, 색상/크기 기준 설정
+            - 📊 **실시간 네트워크 통계**: 밀도, 클러스터링, 중심성 분포 등
             
             **출력 파일**: 구간별 독립 파일 생성
             - 각 구간에 대한 별도의 노드/엣지 파일
@@ -1875,7 +2820,271 @@ def main():
                 4. **누적 특허 건수**: 시간에 따른 누적 특허 수
                 5. **구간 하이라이트**: 설정한 비교 구간을 차트에 표시
                 """)
+        
+        # 네트워크 시각화 탭 (파일 업로드 전 설명)
+        if enable_network_viz and "🆕 네트워크 시각화" in tabs_dict:
+            with tabs_dict["🆕 네트워크 시각화"]:
+                st.header("🕸️ 인터랙티브 네트워크 시각화")
+                if uploaded_file is None:
+                    st.info("데이터를 업로드하고 분석을 시작하면 인터랙티브 네트워크 그래프가 여기에 표시됩니다.")
+                    
+                    st.markdown("""
+                    ### 🆕 네트워크 시각화 기능 소개
+                    
+                    **인터랙티브 네트워크 그래프**:
+                    - 🖱️ **마우스 인터랙션**: 노드 클릭으로 상세 정보 확인
+                    - 🔍 **확대/축소**: 마우스 휠로 네트워크 세부 탐색
+                    - 🎨 **동적 색상/크기**: 중심성 지표에 따른 노드 시각화
+                    - 📍 **호버 정보**: 노드와 엣지의 상세 데이터 실시간 표시
+                    
+                    **고급 필터링 옵션**:
+                    - 📊 **노드 수 제한**: 성능 최적화를 위한 상위 N개 노드 선택
+                    - ⚖️ **엣지 가중치 필터**: 약한 연결 제거로 핵심 구조 강조
+                    - 🎯 **중심성 기반 정렬**: EC, BC, CC 등 다양한 중심성 지표 활용
+                    
+                    **네트워크 통계 대시보드**:
+                    - 📈 **실시간 통계**: 노드 수, 엣지 수, 밀도, 평균 연결도
+                    - 📊 **분포 히스토그램**: 중심성 지표 및 연결도 분포 시각화
+                    - 🔍 **네트워크 인사이트**: 핵심 노드 및 강한 연결 자동 식별
+                    
+                    **커뮤니티 탐지**:
+                    - 🎨 **자동 색상 분류**: 커뮤니티별 노드 색상 구분
+                    - 🔗 **모듈성 분석**: 네트워크 내 그룹 구조 파악
+                    - 📋 **커뮤니티 정보**: 각 노드의 소속 커뮤니티 표시
+                    
+                    **구간별 비교 시각화**:
+                    - 📅 **시계열 네트워크**: 여러 시기의 네트워크 동시 비교
+                    - 🔄 **구조 변화 추적**: 시간에 따른 네트워크 진화 패턴
+                    - 📊 **통계 대시보드**: 구간별 네트워크 지표 비교
+                    """)
 
 # 앱 실행
 if __name__ == "__main__":
     main()
+
+# 추가 도우미 함수들
+def create_network_summary_report(results_dict, analysis_type):
+    """
+    네트워크 분석 요약 보고서를 생성합니다.
+    """
+    if not results_dict:
+        return None
+    
+    summary = f"# {analysis_type} 네트워크 분석 요약 보고서\n\n"
+    
+    for period_name, result in results_dict.items():
+        edges_df = result['edges']
+        nodes_df = result['nodes']
+        
+        if len(nodes_df) == 0:
+            continue
+        
+        summary += f"## {period_name}\n\n"
+        
+        # 기본 통계
+        summary += f"- **노드 수**: {len(nodes_df)}개\n"
+        summary += f"- **엣지 수**: {len(edges_df)}개\n"
+        
+        if len(edges_df) > 0:
+            # 네트워크 밀도
+            max_edges = len(nodes_df) * (len(nodes_df) - 1) / 2
+            density = len(edges_df) / max_edges if max_edges > 0 else 0
+            summary += f"- **네트워크 밀도**: {density:.4f}\n"
+            
+            # 가장 강한 연결
+            strongest_edge = edges_df.loc[edges_df['Weight'].idxmax()]
+            source_name = nodes_df.loc[nodes_df['id'] == strongest_edge['Source'], 'Name'].iloc[0]
+            target_name = nodes_df.loc[nodes_df['id'] == strongest_edge['Target'], 'Name'].iloc[0]
+            summary += f"- **가장 강한 연결**: {source_name} ↔ {target_name} (가중치: {strongest_edge['Weight']})\n"
+        
+        # 중심성 지표 상위 노드
+        if 'EC' in nodes_df.columns:
+            top_ec = nodes_df.loc[nodes_df['EC'].idxmax()]
+            summary += f"- **최고 고유벡터 중심성**: {top_ec['Name']} ({top_ec['EC']:.4f})\n"
+        
+        if 'BC' in nodes_df.columns:
+            top_bc = nodes_df.loc[nodes_df['BC'].idxmax()]
+            summary += f"- **최고 매개 중심성**: {top_bc['Name']} ({top_bc['BC']:.4f})\n"
+        
+        if 'CC' in nodes_df.columns:
+            top_cc = nodes_df.loc[nodes_df['CC'].idxmax()]
+            summary += f"- **최고 근접 중심성**: {top_cc['Name']} ({top_cc['CC']:.4f})\n"
+        
+        summary += "\n---\n\n"
+    
+    return summary
+
+def export_network_to_graphml(edges_df, nodes_df, filename):
+    """
+    네트워크 데이터를 GraphML 형식으로 내보냅니다.
+    """
+    try:
+        G = nx.Graph()
+        
+        # 노드 추가
+        for _, node in nodes_df.iterrows():
+            G.add_node(node['id'], **node.to_dict())
+        
+        # 엣지 추가
+        for _, edge in edges_df.iterrows():
+            G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+        
+        # GraphML로 저장
+        nx.write_graphml(G, filename)
+        return True
+    except Exception as e:
+        st.error(f"GraphML 내보내기 오류: {e}")
+        return False
+
+def calculate_network_evolution_metrics(period_results):
+    """
+    네트워크 진화 지표를 계산합니다.
+    """
+    if len(period_results) < 2:
+        return None
+    
+    period_names = list(period_results.keys())
+    evolution_metrics = {}
+    
+    for i in range(1, len(period_names)):
+        prev_period = period_names[i-1]
+        curr_period = period_names[i]
+        
+        prev_nodes = set(period_results[prev_period]['nodes']['Name'].tolist())
+        curr_nodes = set(period_results[curr_period]['nodes']['Name'].tolist())
+        
+        # 노드 진화 지표
+        stability = len(prev_nodes & curr_nodes) / len(prev_nodes | curr_nodes) if len(prev_nodes | curr_nodes) > 0 else 0
+        growth_rate = (len(curr_nodes) - len(prev_nodes)) / len(prev_nodes) if len(prev_nodes) > 0 else 0
+        turnover_rate = len(prev_nodes ^ curr_nodes) / len(prev_nodes | curr_nodes) if len(prev_nodes | curr_nodes) > 0 else 0
+        
+        evolution_metrics[f"{prev_period} → {curr_period}"] = {
+            'stability': stability,
+            'growth_rate': growth_rate,
+            'turnover_rate': turnover_rate,
+            'new_nodes': len(curr_nodes - prev_nodes),
+            'lost_nodes': len(prev_nodes - curr_nodes),
+            'total_nodes_prev': len(prev_nodes),
+            'total_nodes_curr': len(curr_nodes)
+        }
+    
+    return evolution_metrics
+
+def create_evolution_visualization(evolution_metrics):
+    """
+    네트워크 진화 지표를 시각화합니다.
+    """
+    if not evolution_metrics:
+        return None
+    
+    transitions = list(evolution_metrics.keys())
+    stability_scores = [evolution_metrics[t]['stability'] for t in transitions]
+    growth_rates = [evolution_metrics[t]['growth_rate'] for t in transitions]
+    turnover_rates = [evolution_metrics[t]['turnover_rate'] for t in transitions]
+    
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=['네트워크 안정성', '성장률', '교체율'],
+        specs=[[{"secondary_y": False}, {"secondary_y": False}, {"secondary_y": False}]]
+    )
+    
+    # 안정성
+    fig.add_trace(
+        go.Bar(x=transitions, y=stability_scores, name='안정성', marker_color='blue'),
+        row=1, col=1
+    )
+    
+    # 성장률
+    fig.add_trace(
+        go.Bar(x=transitions, y=growth_rates, name='성장률', 
+               marker_color=['green' if x >= 0 else 'red' for x in growth_rates]),
+        row=1, col=2
+    )
+    
+    # 교체율
+    fig.add_trace(
+        go.Bar(x=transitions, y=turnover_rates, name='교체율', marker_color='orange'),
+        row=1, col=3
+    )
+    
+    fig.update_layout(
+        title='네트워크 진화 지표',
+        showlegend=False,
+        height=400
+    )
+    
+    return fig
+
+# 마지막으로 추가적인 유틸리티 함수
+def validate_network_data(edges_df, nodes_df):
+    """
+    네트워크 데이터의 유효성을 검사합니다.
+    """
+    issues = []
+    
+    if len(nodes_df) == 0:
+        issues.append("노드 데이터가 없습니다.")
+    
+    if len(edges_df) == 0:
+        issues.append("엣지 데이터가 없습니다.")
+    
+    # 노드 ID 중복 검사
+    if len(nodes_df) > 0 and nodes_df['id'].duplicated().any():
+        issues.append("중복된 노드 ID가 있습니다.")
+    
+    # 엣지 참조 유효성 검사
+    if len(edges_df) > 0 and len(nodes_df) > 0:
+        valid_node_ids = set(nodes_df['id'])
+        invalid_sources = ~edges_df['Source'].isin(valid_node_ids)
+        invalid_targets = ~edges_df['Target'].isin(valid_node_ids)
+        
+        if invalid_sources.any() or invalid_targets.any():
+            issues.append("존재하지 않는 노드를 참조하는 엣지가 있습니다.")
+    
+    return issues
+
+def optimize_network_layout(G, layout_algorithm='spring'):
+    """
+    네트워크 레이아웃을 최적화합니다.
+    """
+    layouts = {
+        'spring': nx.spring_layout,
+        'circular': nx.circular_layout,
+        'random': nx.random_layout,
+        'shell': nx.shell_layout,
+        'spectral': nx.spectral_layout
+    }
+    
+    if layout_algorithm in layouts:
+        try:
+            return layouts[layout_algorithm](G, seed=42)
+        except:
+            # Fallback to spring layout
+            return nx.spring_layout(G, seed=42)
+    else:
+        return nx.spring_layout(G, seed=42)
+
+# 성능 최적화를 위한 캐싱 함수들
+@st.cache_data
+def cached_centrality_calculation(edges_list, nodes_list):
+    """
+    중심성 계산을 캐싱합니다.
+    """
+    edges_df = pd.DataFrame(edges_list)
+    nodes_df = pd.DataFrame(nodes_list)
+    return calculate_centrality_measures(edges_df, nodes_df)
+
+@st.cache_data  
+def cached_layout_calculation(edges_list, nodes_list, algorithm='spring'):
+    """
+    레이아웃 계산을 캐싱합니다.
+    """
+    G = nx.Graph()
+    
+    for node in nodes_list:
+        G.add_node(node['id'])
+    
+    for edge in edges_list:
+        G.add_edge(edge['Source'], edge['Target'], weight=edge['Weight'])
+    
+    return optimize_network_layout(G, algorithm)
