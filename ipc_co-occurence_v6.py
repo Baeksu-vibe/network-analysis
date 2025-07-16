@@ -17,13 +17,13 @@ from datetime import datetime, date
 
 # 페이지 설정
 st.set_page_config(
-    page_title="특허 시계열 동시출현빈도 분석 도구",
+    page_title="특허 네트워크 분석 도구",
     page_icon="📊",
     layout="wide"
 )
 
 # 앱 제목 및 설명
-st.title("특허 시계열 동시출현빈도 분석 도구")
+st.title("특허 네트워크 분석 도구")
 st.markdown("""
 이 도구는 특허 데이터에서 다음 항목들의 시계열 동시출현빈도를 분석하여 네트워크 분석용 파일을 생성합니다:
 - **IPC 코드** 동시출현빈도 (시계열 분석)
