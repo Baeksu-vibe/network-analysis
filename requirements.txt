@@ -1,24 +1,23 @@
 # Web framework
 streamlit>=1.28.0
-
 # Data manipulation
 pandas>=1.5.0
 numpy>=1.21.0
-
 # Network analysis
 networkx>=2.8.0
-
 # Visualization
 plotly>=5.15.0
-
+matplotlib>=3.7.0
+seaborn>=0.12.0
 # Excel handling
 openpyxl>=3.0.0
-
+xlrd>=2.0.0
 # Date handling
 python-dateutil>=2.8.2
-
 # File encoding
 base64io>=1.0.0 ; sys_platform != 'win32'
-
 # Streamlit spinner compatibility
 tqdm>=4.64.0
+# Additional requirements for collections and itertools (usually built-in)
+# Collections module is built-in, but Counter is used
+# itertools module is built-in, but combinations is used
